@@ -7,8 +7,10 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy.exc import SQLAlchemyError
-from concurrent.futures import ThreadPoolExecutor
+from asyncpg import create_pool
 from aiomonitor import Monitor
+from concurrent.futures import ThreadPoolExecutor
+import os
 
 # 配置日志记录
 logging.basicConfig(filename='process_stats.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -17,12 +19,13 @@ logging.basicConfig(filename='process_stats.log', level=logging.INFO, format='%(
 config = configparser.ConfigParser()
 config.read('config.ini')
 
-DB_PATH = config.get('Database', 'DB_PATH', fallback='sqlite:///detailed_process_stats.db')
-UPDATE_INTERVAL = config.getint('Settings', 'UPDATE_INTERVAL', fallback=10)
-MONITOR_INTERVAL = config.getint('Settings', 'MONITOR_INTERVAL', fallback=60)
+DB_PATH = os.getenv('DB_PATH', config.get('Database', 'DB_PATH', fallback='postgresql+asyncpg://localhost/detailed_process_stats'))
+UPDATE_INTERVAL = int(os.getenv('UPDATE_INTERVAL', config.get('Settings', 'UPDATE_INTERVAL', fallback=10)))
+MONITOR_INTERVAL = int(os.getenv('MONITOR_INTERVAL', config.get('Settings', 'MONITOR_INTERVAL', fallback=60)))
+MAX_WORKERS = int(os.getenv('MAX_WORKERS', config.get('Settings', 'MAX_WORKERS', fallback=10)))
 
-# 创建 SQLAlchemy 引擎和会话
-engine = create_engine(DB_PATH, echo=False)  # echo=False 以减少日志输出
+# SQLAlchemy 设置
+engine = create_engine(DB_PATH, echo=False)
 Session = scoped_session(sessionmaker(bind=engine))
 Base = declarative_base()
 
@@ -44,11 +47,11 @@ class ProcessStats(Base):
 Base.metadata.create_all(engine)
 
 def serialize_list(items):
-    """序列化列表，将其转为字符串以便存储在 SQLite 中"""
+    """序列化列表，将其转为字符串以便存储在数据库中"""
     return ', '.join(str(item) for item in items)
 
-async def collect_process_stats():
-    """定期收集进程信息"""
+async def collect_process_stats(queue):
+    """定期收集进程信息并将其放入队列中"""
     while True:
         current_processes = {}
         for p in psutil.process_iter(['pid', 'name', 'cmdline', 'cpu_times', 'memory_info', 'num_threads', 'open_files', 'connections']):
@@ -69,76 +72,120 @@ async def collect_process_stats():
                 logging.warning(f"Could not retrieve information for process PID: {p.pid}. Reason: {str(e)}")
                 continue
         
-        await update_process_stats(current_processes)
+        await queue.put(current_processes)
         await asyncio.sleep(UPDATE_INTERVAL)  # 每 UPDATE_INTERVAL 秒更新一次
 
-async def update_process_stats(processes):
-    """更新数据库中的进程信息"""
-    loop = asyncio.get_running_loop()
-    with ThreadPoolExecutor() as pool:
-        await loop.run_in_executor(pool, _update_process_stats_db, processes)
+async def update_process_stats(pool, queue):
+    """从队列中获取进程信息并更新数据库"""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            while True:
+                processes = await queue.get()
+                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                update_queries = []
+                insert_queries = []
 
-def _update_process_stats_db(processes):
-    """批量更新和插入进程信息到数据库"""
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    session = Session()
-    try:
-        for pid, info in processes.items():
-            process = session.query(ProcessStats).filter_by(pid=pid, cmdline=info['cmdline']).first()
-            
-            if process:
-                process.cpu_user_time = info['cpu_user_time']
-                process.cpu_system_time = info['cpu_system_time']
-                process.memory_info = info['memory_info']
-                process.threads = info['threads']
-                process.open_files = info['open_files']
-                process.connections = info['connections']
-                process.count += 1
-                process.last_update = current_time
-            else:
-                new_process = ProcessStats(
-                    pid=pid,
-                    name=info['name'],
-                    cmdline=info['cmdline'],
-                    cpu_user_time=info['cpu_user_time'],
-                    cpu_system_time=info['cpu_system_time'],
-                    memory_info=info['memory_info'],
-                    threads=info['threads'],
-                    open_files=info['open_files'],
-                    connections=info['connections'],
-                    count=1,
-                    last_update=current_time
-                )
-                session.add(new_process)
+                for pid, info in processes.items():
+                    result = await conn.fetchrow('''
+                        SELECT cpu_user_time, cpu_system_time, count 
+                        FROM process_stats 
+                        WHERE pid = $1 AND cmdline = $2
+                    ''', pid, info['cmdline'])
+                    
+                    if result:
+                        old_cpu_user_time, old_cpu_system_time, count = result
+                        update_queries.append((
+                            info['cpu_user_time'], 
+                            info['cpu_system_time'], 
+                            info['memory_info'], 
+                            info['threads'], 
+                            info['open_files'], 
+                            info['connections'], 
+                            count + 1, 
+                            current_time, 
+                            pid, 
+                            info['cmdline']
+                        ))
+                    else:
+                        insert_queries.append((
+                            pid, 
+                            info['name'], 
+                            info['cmdline'], 
+                            info['cpu_user_time'], 
+                            info['cpu_system_time'], 
+                            info['memory_info'], 
+                            info['threads'], 
+                            info['open_files'], 
+                            info['connections'], 
+                            1, 
+                            current_time
+                        ))
 
-        session.commit()
-    except SQLAlchemyError as e:
-        logging.error(f"Error updating database: {str(e)}")
-    finally:
-        session.remove()  # 关闭会话
+                if update_queries:
+                    try:
+                        await conn.executemany('''
+                        UPDATE process_stats SET 
+                            cpu_user_time = $1, 
+                            cpu_system_time = $2, 
+                            memory_info = $3, 
+                            threads = $4, 
+                            open_files = $5, 
+                            connections = $6, 
+                            count = $7, 
+                            last_update = $8
+                        WHERE pid = $9 AND cmdline = $10''', update_queries)
+                    except SQLAlchemyError as e:
+                        logging.error(f"Failed to update database: {str(e)}")
+
+                if insert_queries:
+                    try:
+                        await conn.executemany('''
+                        INSERT INTO process_stats (
+                            pid, 
+                            name, 
+                            cmdline, 
+                            cpu_user_time, 
+                            cpu_system_time, 
+                            memory_info, 
+                            threads, 
+                            open_files, 
+                            connections, 
+                            count,
+                            last_update
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)''', insert_queries)
+                    except SQLAlchemyError as e:
+                        logging.error(f"Failed to insert into database: {str(e)}")
 
 async def monitor_system():
     """监控系统健康状况"""
     while True:
-        # 记录系统的内存和CPU使用情况
         mem = psutil.virtual_memory()
         cpu = psutil.cpu_percent(interval=1)
         logging.info(f"Memory Usage: {mem.percent}% | CPU Usage: {cpu}%")
         await asyncio.sleep(MONITOR_INTERVAL)  # 每 MONITOR_INTERVAL 秒记录一次
 
-def main():
+async def async_main():
     """主函数，初始化数据库并开始进程信息收集和系统监控"""
-    try:
-        with Monitor():
-            asyncio.run(asyncio.gather(
-                collect_process_stats(),
+    pool = await create_pool(dsn=DB_PATH)
+    queue = asyncio.Queue()
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(executor)
+        
+        async with Monitor():
+            await asyncio.gather(
+                collect_process_stats(queue),
+                update_process_stats(pool, queue),
                 monitor_system()
-            ))
+            )
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(async_main())
     except KeyboardInterrupt:
         logging.info("Process stats collection stopped.")
     except Exception as e:
         logging.error(f"Unexpected error: {str(e)}")
-        main()  # 重新启动以实现错误恢复
-
-if __name__ == "__main__":
-    main()
+        # 尝试重新启动程序
+        os.execv(__file__, ['python'] + [__file__])
